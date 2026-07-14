@@ -1,0 +1,31 @@
+name: Sync Databricks Git folder
+
+on:
+  push:
+    branches: [main]
+
+env:
+  # Adjust these if your workspace paths / app name differ
+  DATABRICKS_REPO_PATH: /Workspace/Repos/yelyzaveta.popova@sigma.software/DatabricksRFP
+  APP_NAME: test-from-repo
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Pull latest commit into workspace Git folder
+        run: databricks repos update "$DATABRICKS_REPO_PATH" --branch main
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+      # Deploy is intentionally a manual step (click Deploy on the app page).
+      # Uncomment to also auto-deploy the app on every push:
+      # - name: Deploy the app
+      #   run: databricks apps deploy "$APP_NAME" --source-code-path "$DATABRICKS_REPO_PATH/app"
+      #   env:
+      #     DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      #     DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
