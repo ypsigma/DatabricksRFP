@@ -15,35 +15,48 @@ warehouse, so the identical SQL works through either executor.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Callable
 
 Execute = Callable[[str], list]
 
+logger = logging.getLogger("rfp.lib")
+
 # ── Field set (single source of truth) ────────────────────────────────────────
 EXTRACTION_FIELDS = [
-    "project_name", "issuing_org",
-    "submission_deadline", "qa_deadline", "project_start_end", "milestones",
-    "budget", "pricing_model", "payment_terms", "penalties",
-    "technical_score_weighting", "price_weighting", "team_experience_weighting",
-    "functional_requirements", "technical_requirements", "compliance_requirements",
-    "required_certifications", "minimum_experience", "financial_thresholds",
-    "liability", "governing_law", "contract_type", "termination_clauses",
-    "deliverables", "project_scale", "scope_summary",
-    "proposal_structure", "mandatory_forms", "page_limits",
-    "provided_templates", "submission_instructions",
+    "client_name",
+    "domain",
+    "summary",
+    "submission_deadline",
+    "budget",
+    "roles_required",
+    "technologies",
+    "evaluation_criteria",
+    "compliance_requirements",
+    "response_format",
 ]
+
+CONFIDENCE_LEVELS = ["High", "Medium", "Low", "Not found"]
 
 EXTRACTION_PROMPT = """
 You are extracting structured data from an RFP (Request for Proposal) document.
 Return ONLY a valid JSON object with exactly these keys:
 {fields}
 
+Each key must map to an object with exactly two keys:
+  "value": string — the extracted content
+  "confidence": one of "High", "Medium", "Low", "Not found"
+
 Rules:
-- Use "not stated" (exact string) if a field is not present in the document.
-- For list-type fields (requirements, milestones, deliverables, etc.) join items with newlines.
+- confidence "High" = explicitly and unambiguously stated in the document.
+- confidence "Medium" = stated but ambiguous, scattered, or requires light interpretation.
+- confidence "Low" = only partially stated or inferred from context.
+- confidence "Not found" = absent; then value must be the exact string "not stated".
+- roles_required: needed roles/team with count and seniority when stated, one per line.
+- technologies / evaluation_criteria / compliance_requirements: one item per line.
 - Do not add commentary, markdown fences, or any text outside the JSON.
-- Do not infer or guess values not explicitly stated in the document.
+- Do not invent values that are not in the document.
 
 RFP document:
 {text}
@@ -86,12 +99,28 @@ def _table_ddl(full_table: str) -> str:
     """
 
 
+def _fields_table_ddl(fields_table: str) -> str:
+    """Long-format field store: one row per field per extraction or correction."""
+    return f"""
+        CREATE TABLE IF NOT EXISTS {fields_table} (
+        rfp_id STRING,
+        field_name STRING,
+        extracted_value STRING,
+        confidence STRING,
+        source STRING,
+        reviewer_id STRING,
+        created_ts TIMESTAMP
+        )
+    """
+
+
 def ensure_infra(
     execute: Execute,
     catalog: str,
     schema: str,
     volume: str,
     full_table: str,
+    fields_table: str,
 ) -> list[str]:
     """
     Ensure the schema, volume, and table exist; create whatever is missing.
@@ -110,21 +139,29 @@ def ensure_infra(
          f"DESCRIBE VOLUME {catalog}.{schema}.{volume}"),
         (_table_ddl(full_table),
          f"DESCRIBE TABLE {full_table}"),
+        (_fields_table_ddl(fields_table),
+         f"DESCRIBE TABLE {fields_table}"),
     ]
     for create_sql, probe_sql in steps:
+        target = probe_sql.split(" ", 2)[2]
+        logger.info("bootstrap: ensuring %s …", target)
         try:
             execute(create_sql)
+            logger.info("bootstrap: %s OK", target)
         except Exception as create_exc:
-            target = probe_sql.split(" ", 2)[2]
+            logger.warning("bootstrap: CREATE failed for %s (%s); probing existence", target, create_exc)
             try:
                 execute(probe_sql)
+                logger.info("bootstrap: %s exists — continuing without create rights", target)
                 warnings.append(
                     f"No permission to create {target}, but it already exists — continuing."
                 )
             except Exception:
+                logger.error("bootstrap: %s missing and uncreatable", target)
                 raise RuntimeError(
                     f"{target} is missing and could not be created: {create_exc}"
                 ) from create_exc
+    logger.info("bootstrap: all infrastructure verified")
     return warnings
 
 
@@ -162,7 +199,11 @@ def parse_document(execute: Execute, volume_path: str, rfp_id: str) -> tuple[str
 
 # ── Extract ─────────────────────────────────────────────────────────────────────
 def extract_fields(execute: Execute, fm_endpoint: str, raw_text: str) -> dict:
-    """Extract all fields in one ai_query call (runs on the warehouse). Returns a dict."""
+    """
+    Extract all fields in one ai_query call (runs on the warehouse).
+    Returns {field: {"value": str, "confidence": str}}, normalized so every
+    EXTRACTION_FIELDS key is present even if the model omitted it.
+    """
     text_guard = raw_text[:RAW_TEXT_LIMIT]
     fields_list = ", ".join(EXTRACTION_FIELDS)
     prompt = EXTRACTION_PROMPT.format(fields=fields_list, text=text_guard)
@@ -172,13 +213,25 @@ def extract_fields(execute: Execute, fm_endpoint: str, raw_text: str) -> dict:
         SELECT ai_query(
             '{fm_endpoint}',
             '{safe_prompt}',
-            modelParameters => named_struct('max_tokens', 2000, 'temperature', 0.0)
+            modelParameters => named_struct('max_tokens', 4000, 'temperature', 0.0)
         ) AS fields_json
     """)
 
     raw_json = _row(rows)["fields_json"]
     cleaned = re.sub(r"(`*\s*json)|(\s*\`)", "", raw_json).strip()
-    return json.loads(cleaned)
+    parsed = json.loads(cleaned)
+
+    normalized = {}
+    for f in EXTRACTION_FIELDS:
+        entry = parsed.get(f) or {}
+        if not isinstance(entry, dict):  # model returned a bare string
+            entry = {"value": str(entry), "confidence": "Low"}
+        conf = entry.get("confidence", "Low")
+        normalized[f] = {
+            "value": str(entry.get("value", "not stated")),
+            "confidence": conf if conf in CONFIDENCE_LEVELS else "Low",
+        }
+    return normalized
 
 
 # ── Persist ──────────────────────────────────────────────────────────────────────
@@ -217,6 +270,83 @@ def write_to_delta(
     """)
 
 
+# ── Field rows: extraction history + reviewer overrides ─────────────────────────
+def write_field_rows(
+    execute: Execute,
+    fields_table: str,
+    rfp_id: str,
+    extracted: dict,
+    source: str = "ai_extracted",
+    reviewer_id: str | None = None,
+) -> None:
+    """Append one row per field. Corrections are new rows, never updates."""
+    values = ",\n".join(
+        f"('{rfp_id}', '{f}', '{_esc(d['value'])}', '{_esc(d['confidence'])}', "
+        f"'{source}', {('NULL' if reviewer_id is None else repr(reviewer_id))}, current_timestamp())"
+        for f, d in extracted.items()
+    )
+    execute(f"""
+        INSERT INTO {fields_table}
+        (rfp_id, field_name, extracted_value, confidence, source, reviewer_id, created_ts)
+        VALUES {values}
+    """)
+
+
+def get_current_fields(execute: Execute, fields_table: str, rfp_id: str) -> dict:
+    """
+    Current state per field = the latest row. Returns
+    {field: {"value", "confidence", "source"}} in EXTRACTION_FIELDS order.
+    """
+    rows = execute(f"""
+        SELECT field_name, extracted_value, confidence, source
+        FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY field_name ORDER BY created_ts DESC
+            ) AS rn
+            FROM {fields_table}
+            WHERE rfp_id = '{rfp_id}'
+        )
+        WHERE rn = 1
+    """)
+    by_name = {r["field_name"]: r for r in map(dict, (_row(rows, i) for i in range(len(rows))))}
+    return {
+        f: {
+            "value": by_name.get(f, {}).get("extracted_value", "not stated"),
+            "confidence": by_name.get(f, {}).get("confidence", "Not found"),
+            "source": by_name.get(f, {}).get("source", "ai_extracted"),
+        }
+        for f in EXTRACTION_FIELDS
+    }
+
+
+def save_overrides(
+    execute: Execute,
+    fields_table: str,
+    full_table: str,
+    rfp_id: str,
+    changes: dict,
+    reviewer_id: str,
+) -> None:
+    """
+    Persist reviewer corrections: append override rows to the fields table
+    (audit trail), then sync the wide table so chat/banner see current values.
+    `changes` = {field: new_value} for edited fields only.
+    """
+    if not changes:
+        return
+    entries = {
+        f: {"value": v, "confidence": "High"}  # human-confirmed = High
+        for f, v in changes.items()
+    }
+    write_field_rows(
+        execute, fields_table, rfp_id, entries,
+        source="reviewer_override", reviewer_id=reviewer_id,
+    )
+    set_clause = ", ".join(f"{f} = '{_esc(v)}'" for f, v in changes.items())
+    execute(f"UPDATE {full_table} SET {set_clause} WHERE rfp_id = '{rfp_id}'")
+    logger.info("overrides %s: %d fields saved by %s", rfp_id, len(changes), reviewer_id)
+
+
 # ── Orchestration ────────────────────────────────────────────────────────────────
 def run_ingestion(
     execute: Execute,
@@ -224,6 +354,7 @@ def run_ingestion(
     volume_path: str,
     fm_endpoint: str,
     rfp_id: str,
+    fields_table: str,
 ) -> str:
     """
     Full pipeline for one RFP. Returns 'ALREADY_READY', 'READY', or 'FAILED'.
@@ -243,13 +374,20 @@ def run_ingestion(
         filename = meta.get("original_filename") or "unknown.pdf"
         file_path = meta.get("volume_path") or f"{volume_path}/{rfp_id}/"
 
+        logger.info("ingestion %s: parsing document …", rfp_id)
         raw_text, page_count = parse_document(execute, volume_path, rfp_id)
+        logger.info("ingestion %s: parsed %d pages, %d chars", rfp_id, page_count, len(raw_text))
         if not raw_text.strip():
             raise ValueError("Parsed text is empty — the PDF may be corrupted or image-only.")
 
+        logger.info("ingestion %s: extracting fields …", rfp_id)
         extracted = extract_fields(execute, fm_endpoint, raw_text)
+        logger.info("ingestion %s: extracted %d fields, writing to Delta", rfp_id, len(extracted))
+        flat_values = {f: d["value"] for f, d in extracted.items()}
         write_to_delta(execute, full_table, rfp_id, filename, file_path,
-                       extracted, raw_text, page_count)
+                       flat_values, raw_text, page_count)
+        write_field_rows(execute, fields_table, rfp_id, extracted)
+        logger.info("ingestion %s: READY", rfp_id)
         return "READY"
 
     except Exception as exc:
@@ -267,48 +405,19 @@ def build_system_prompt(row: dict) -> str:
     """Build the chat system prompt from a Delta row (structured fields + raw text)."""
     raw = (row.get("raw_text") or "")[:RAW_TEXT_LIMIT]
 
-    def f(key):
-        return row.get(key) or "not stated"
+    field_lines = "\n".join(
+        f"{f.replace('_', ' ').capitalize()}:\n{row.get(f) or 'not stated'}"
+        for f in EXTRACTION_FIELDS
+    )
 
     return f"""You are an assistant answering questions about ONE specific RFP document.
 Use ONLY the information provided below. If information is absent, say "not stated in this RFP".
 Do not infer, extrapolate, or fabricate details.
+The structured fields have been reviewed by a human and take precedence over the
+document text if they disagree.
 
-== STRUCTURED FIELDS ==
-Project name: {f('project_name')}
-Issuing organisation: {f('issuing_org')}
-Submission deadline: {f('submission_deadline')}
-Q&A deadline: {f('qa_deadline')}
-Project start/end: {f('project_start_end')}
-Milestones: {f('milestones')}
-Budget: {f('budget')}
-Pricing model: {f('pricing_model')}
-Payment terms: {f('payment_terms')}
-Penalties: {f('penalties')}
-Evaluation weighting — technical / price / team: {f('technical_score_weighting')} / {f('price_weighting')} / {f('team_experience_weighting')}
-Functional requirements:
-{f('functional_requirements')}
-Technical requirements:
-{f('technical_requirements')}
-Compliance requirements:
-{f('compliance_requirements')}
-Required certifications: {f('required_certifications')}
-Minimum experience: {f('minimum_experience')}
-Financial thresholds: {f('financial_thresholds')}
-Liability: {f('liability')}
-Governing law: {f('governing_law')}
-Contract type: {f('contract_type')}
-Termination clauses: {f('termination_clauses')}
-Deliverables:
-{f('deliverables')}
-Project scale: {f('project_scale')}
-Scope summary: {f('scope_summary')}
-Proposal structure: {f('proposal_structure')}
-Mandatory forms: {f('mandatory_forms')}
-Page limits: {f('page_limits')}
-Provided templates: {f('provided_templates')}
-Submission instructions:
-{f('submission_instructions')}
+== STRUCTURED FIELDS (human-reviewed) ==
+{field_lines}
 
 == FULL DOCUMENT TEXT (first {RAW_TEXT_LIMIT:,} characters) ==
 {raw}

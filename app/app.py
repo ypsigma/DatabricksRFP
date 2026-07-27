@@ -1,10 +1,25 @@
 # """RFP Assistant — Databricks App (Phase 1)."""
 from __future__ import annotations
 
+# Use the OS trust store (macOS Keychain / Linux CA dir) instead of Python's
+# bundled certs — required when a corporate VPN re-signs TLS traffic with a
+# company CA that only the OS store trusts. Must run before anything opens
+# TLS connections. No-op where nothing intercepts.
+import truststore
+
+truststore.inject_into_ssl()
+
+import logging
 import os
 import time
 import uuid
 from typing import Generator
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("rfp.app")
 
 import streamlit as st
 from databricks import sql as dbsql
@@ -24,8 +39,9 @@ WAREHOUSE_HTTP_PATH = os.environ["WAREHOUSE_HTTP_PATH"]
 WORKSPACE_HOST      = os.environ["WORKSPACE_HOST"]
 KA_ENDPOINT         = os.environ.get("KA_ENDPOINT", "")  # empty = KA disabled
 
-VOLUME_PATH = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}"
-FULL_TABLE  = f"{CATALOG}.{SCHEMA}.{TABLE}"
+VOLUME_PATH  = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}"
+FULL_TABLE   = f"{CATALOG}.{SCHEMA}.{TABLE}"
+FIELDS_TABLE = f"{FULL_TABLE}_fields"   # long-format field store (audit + overrides)
 
 
 # ── Auth (Databricks Apps service principal) ──────────────────────────────────
@@ -40,19 +56,28 @@ def _config() -> Config:
 # ── SQL connector ─────────────────────────────────────────────────────────────
 def _sql_conn():
     cfg = _config()
-    return dbsql.connect(
+    t0 = time.time()
+    logger.info("SQL: connecting to warehouse %s …", WAREHOUSE_HTTP_PATH)
+    conn = dbsql.connect(
         server_hostname=cfg.host.replace("https://", ""),
         http_path=WAREHOUSE_HTTP_PATH,
         credentials_provider=lambda: cfg.authenticate,
     )
+    logger.info("SQL: connected in %.1fs", time.time() - t0)
+    return conn
 
 
 def _run_sql(query: str, params: dict | None = None):
     """Executes a SQL query and returns all rows as a list of Row-like objects."""
+    head = " ".join(query.split())[:120]
+    t0 = time.time()
+    logger.info("SQL run: %s …", head)
     with _sql_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(query, params or {})
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+    logger.info("SQL run done in %.1fs (%d rows)", time.time() - t0, len(rows))
+    return rows
 
 
 def _execute(query: str) -> list[dict]:
@@ -60,13 +85,19 @@ def _execute(query: str) -> list[dict]:
     Executor passed to rfp_lib. Runs SQL on the warehouse and returns rows as dicts.
     Returns [] for statements with no result set (UPDATE / MERGE / INSERT).
     """
+    head = " ".join(query.split())[:120]
+    t0 = time.time()
+    logger.info("SQL exec: %s …", head)
     with _sql_conn() as conn:
         cur = conn.cursor()
         cur.execute(query)
         if cur.description:
             cols = [c[0] for c in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
-        return []
+            result = [dict(zip(cols, r)) for r in cur.fetchall()]
+        else:
+            result = []
+    logger.info("SQL exec done in %.1fs (%d rows)", time.time() - t0, len(result))
+    return result
 
 
 # ── FM API client (OpenAI-compatible) ─────────────────────────────────────────
@@ -119,6 +150,7 @@ def run_ingestion(rfp_id: str, uploaded_file) -> str:
         volume_path=VOLUME_PATH,
         fm_endpoint=FM_ENDPOINT,
         rfp_id=rfp_id,
+        fields_table=FIELDS_TABLE,
     )
 
 
@@ -216,7 +248,7 @@ def chat_stream(
 def list_ready_rfps() -> list[dict]:
     """Returns READY RFPs ordered by most recently ingested."""
     rows = _run_sql(f"""
-        SELECT rfp_id, project_name, original_filename, ingested_at
+        SELECT rfp_id, client_name, original_filename, ingested_at
         FROM {FULL_TABLE}
         WHERE status = 'READY'
         ORDER BY ingested_at DESC
@@ -224,7 +256,8 @@ def list_ready_rfps() -> list[dict]:
     return [
         {
             "rfp_id": r.rfp_id,
-            "label": r.project_name or r.original_filename,
+            "label": r.client_name if r.client_name not in (None, "", "not stated")
+                     else r.original_filename,
         }
         for r in rows
     ]
@@ -259,6 +292,7 @@ def _ensure_infra() -> list[str]:
         schema=SCHEMA,
         volume=VOLUME,
         full_table=FULL_TABLE,
+        fields_table=FIELDS_TABLE,
     )
 
 try:
@@ -349,13 +383,13 @@ current_rfp_id = st.session_state.rfp_id
 
 # Show basic RFP info as a banner
 rows = _run_sql(f"""
-    SELECT project_name, original_filename, submission_deadline, budget, status
+    SELECT client_name, original_filename, submission_deadline, budget, status
     FROM {FULL_TABLE} WHERE rfp_id = '{current_rfp_id}'
 """)
 if rows:
     r = rows[0]
     col1, col2, col3 = st.columns(3)
-    col1.metric("Project", r.project_name or r.original_filename)
+    col1.metric("Client", r.client_name or r.original_filename)
     col2.metric("Submission deadline", r.submission_deadline or "not stated")
     col3.metric("Budget", r.budget or "not stated")
 
@@ -365,21 +399,86 @@ if rows:
 
 st.divider()
 
-# Render conversation history
-for msg in st.session_state.messages:
-    st.chat_message(msg["role"]).write(msg["content"])
+# ── Reviewer identity ──────────────────────────────────────────────────────────
+# Deployed: Databricks Apps injects the logged-in user's email as a header.
+# Locally there are no forwarded headers — fall back to a dev marker.
+REVIEWER_ID = st.context.headers.get("X-Forwarded-Email") or "local-dev"
 
-# Chat input
-if prompt := st.chat_input("Ask about this RFP…"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    st.chat_message("user").write(prompt)
+CONFIDENCE_BADGE = {
+    "High": "🟢 High",
+    "Medium": "🟡 Medium",
+    "Low": "🔴 Low",
+    "Not found": "⚪ Not found",
+}
+MULTILINE_FIELDS = {
+    "summary", "roles_required", "technologies",
+    "evaluation_criteria", "compliance_requirements", "response_format",
+}
 
-    with st.chat_message("assistant"):
-        stream = chat_stream(
-            current_rfp_id,
-            # Pass only the conversation turns (not the system prompt) to the API
-            [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
+tab_fields, tab_chat = st.tabs(["📋 Extracted fields", "💬 Chat"])
+
+# ── Tab 1: extracted fields — review & correct ─────────────────────────────────
+with tab_fields:
+    try:
+        current = rfp_lib.get_current_fields(_execute, FIELDS_TABLE, current_rfp_id)
+    except Exception as e:
+        st.error(f"Could not load extracted fields: {e}")
+        current = None
+
+    if current:
+        st.caption(
+            "Values extracted by AI with a confidence signal. Edit anything that's "
+            "wrong and press **Save corrections** — corrections are stored as "
+            "reviewer overrides (the AI's original values are kept for audit)."
         )
-        answer = st.write_stream(stream)
+        with st.form("fields_form"):
+            edited: dict[str, str] = {}
+            for field, info in current.items():
+                label = field.replace("_", " ").capitalize()
+                badge = CONFIDENCE_BADGE.get(info["confidence"], info["confidence"])
+                suffix = "  ·  ✏️ corrected" if info["source"] == "reviewer_override" else ""
+                widget = st.text_area if field in MULTILINE_FIELDS else st.text_input
+                edited[field] = widget(
+                    f"{label}   ({badge}{suffix})",
+                    value=info["value"],
+                    key=f"field_{current_rfp_id}_{field}",
+                )
+            submitted = st.form_submit_button("💾 Save corrections", type="primary")
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        if submitted:
+            changes = {
+                f: v for f, v in edited.items()
+                if v.strip() != (current[f]["value"] or "").strip()
+            }
+            if not changes:
+                st.info("Nothing changed.")
+            else:
+                try:
+                    rfp_lib.save_overrides(
+                        _execute, FIELDS_TABLE, FULL_TABLE,
+                        current_rfp_id, changes, REVIEWER_ID,
+                    )
+                    _load_rfp_row.clear()   # chat context must see corrected values
+                    st.success(f"Saved {len(changes)} correction(s).")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not save corrections: {e}")
+
+# ── Tab 2: chat about this RFP ─────────────────────────────────────────────────
+with tab_chat:
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).write(msg["content"])
+
+    if prompt := st.chat_input("Ask about this RFP…"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.chat_message("user").write(prompt)
+
+        with st.chat_message("assistant"):
+            stream = chat_stream(
+                current_rfp_id,
+                # Pass only the conversation turns (not the system prompt) to the API
+                [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
+            )
+            answer = st.write_stream(stream)
+
+        st.session_state.messages.append({"role": "assistant", "content": answer})
