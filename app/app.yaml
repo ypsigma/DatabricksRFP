@@ -1,1 +1,19 @@
 command: ["streamlit", "run", "app.py"]
+
+env:
+  - name: CATALOG
+    value: "devir"
+  - name: SCHEMA
+    value: "yp_dev"
+  - name: VOLUME
+    value: "raw_rfps"
+  - name: TABLE
+    value: "rfp_documents"          # our own table (colleague's was extracted_fields)
+  - name: FM_ENDPOINT
+    value: "databricks-meta-llama-3-3-70b-instruct"
+  - name: WAREHOUSE_HTTP_PATH
+    value: "/sql/1.0/warehouses/fa454671be3d730e"
+  - name: WORKSPACE_HOST
+    value: "https://adb-1513275754606701.1.azuredatabricks.net"
+  - name: KA_ENDPOINT
+    value: ""                       # empty = chat uses prompt-stuffing (KA path disabled)
