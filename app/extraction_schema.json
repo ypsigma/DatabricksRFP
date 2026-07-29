@@ -1,0 +1,71 @@
+{
+  "client_name": {
+    "type": "string",
+    "description": "The name of the organization issuing this RFP. Use the exact string 'not stated' if not present in the document."
+  },
+  "domain": {
+    "type": "string",
+    "description": "The industry domain of the project, e.g. Healthcare, Insurance, Logistics, E-commerce, Energy. Derive from what the client's business and the described system are about."
+  },
+  "summary": {
+    "type": "string",
+    "description": "A 2-3 sentence summary of what the client wants built or delivered, in plain language."
+  },
+  "submission_deadline": {
+    "type": "string",
+    "description": "The deadline for submitting the proposal, exactly as stated in the document. Use 'not stated' if absent."
+  },
+  "budget": {
+    "type": "string",
+    "description": "The budget amount or range as stated in the document. Use the exact string 'not stated' if the RFP does not disclose a budget. Do not infer or guess an amount."
+  },
+  "roles_required": {
+    "type": "array",
+    "description": "ONLY actual staff positions (job roles) the client asks the vendor to provide - concrete people to be staffed, e.g. 'Solution Architect', 'Data Engineer', 'QA Engineer', 'Test Automation Specialist'. Decision test: a role is a job title that a single person can hold; if an entry names a domain of work, a service, or a scope area instead of a person's job title, it is NOT a role - EXCLUDE entries like 'Data Science & Advanced Analytics', 'Solution Deployment & Testing', 'Systems & Application Integration', 'IT Support & Service Desk', 'Security, Risk & Compliance', 'Managed Infrastructure & Applications'. Those are responsibility clusters / service areas, not staff roles, regardless of what the document calls them. If the document only lists such areas and never names staff positions, return an empty array. Role titles may be listed in one section while seniority and experience requirements appear in other sections - search the ENTIRE document and combine the scattered information per role.",
+    "items": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "The job title of the position exactly as a person would hold it, e.g. 'QA Engineer', 'Solution Architect'. Never a work area or service name."
+        },
+        "seniority": {
+          "type": "string",
+          "description": "The seniority for this role expressed as exactly one of: Junior, Middle, Senior, Lead. Use 'not stated' if the document does not state or clearly imply it anywhere."
+        },
+        "requirements": {
+          "type": "string",
+          "description": "Experience and skill requirements for THIS role gathered from anywhere in the document: years of experience, technologies, certifications, domain knowledge. Use 'not stated' if the document specifies none for this role."
+        }
+      }
+    }
+  },
+  "technologies": {
+    "type": "array",
+    "description": "Required or preferred technologies, platforms, and tools named anywhere in the RFP.",
+    "items": {
+      "type": "string",
+      "description": "One technology, platform, or tool, named as the document names it."
+    }
+  },
+  "evaluation_criteria": {
+    "type": "array",
+    "description": "How the client will score and compare proposals, including weights when stated.",
+    "items": {
+      "type": "string",
+      "description": "One evaluation criterion, including its weight when stated, e.g. 'Technical approach - 40%'."
+    }
+  },
+  "compliance_requirements": {
+    "type": "array",
+    "description": "Certifications, regulatory, legal, or security requirements the vendor must meet, e.g. ISO 27001, GDPR, HIPAA. Do not invent requirements not present in the document.",
+    "items": {
+      "type": "string",
+      "description": "One compliance requirement as stated in the document."
+    }
+  },
+  "response_format": {
+    "type": "string",
+    "description": "Requirements for the proposal document itself: structure, page limits, mandatory forms, provided templates, submission instructions. Use 'not stated' if the RFP specifies none."
+  }
+}

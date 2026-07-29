@@ -9,11 +9,16 @@ import truststore
 
 truststore.inject_into_ssl()
 
+import json
 import logging
 import os
 import time
 import uuid
 from typing import Generator
+
+from dotenv import load_dotenv
+
+load_dotenv()  # local dev: reads app/.env; deployed: no file, no-op (app.yaml wins)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +43,15 @@ FM_ENDPOINT         = os.environ["FM_ENDPOINT"]
 WAREHOUSE_HTTP_PATH = os.environ["WAREHOUSE_HTTP_PATH"]
 WORKSPACE_HOST      = os.environ["WORKSPACE_HOST"]
 KA_ENDPOINT         = os.environ.get("KA_ENDPOINT", "")  # empty = KA disabled
+USE_AI_EXTRACT      = os.environ.get("USE_AI_EXTRACT", "").lower() in ("1", "true", "yes")
+
+# Portal-iterated extraction schema (copied from the IE agent's generated SQL).
+# Loaded once; only used when USE_AI_EXTRACT is on.
+_SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "extraction_schema.json")
+EXTRACT_SCHEMA = ""
+if USE_AI_EXTRACT:
+    with open(_SCHEMA_PATH) as _f:
+        EXTRACT_SCHEMA = _f.read()
 
 VOLUME_PATH  = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}"
 FULL_TABLE   = f"{CATALOG}.{SCHEMA}.{TABLE}"
@@ -151,6 +165,7 @@ def run_ingestion(rfp_id: str, uploaded_file) -> str:
         fm_endpoint=FM_ENDPOINT,
         rfp_id=rfp_id,
         fields_table=FIELDS_TABLE,
+        extract_schema=EXTRACT_SCHEMA,
     )
 
 
@@ -240,6 +255,23 @@ def chat_stream(
                 f"Knowledge Assistant unavailable ({exc}). Falling back to prompt-stuffing."
             )
     yield from _chat_prompt_stuffing(rfp_id, messages)
+
+
+# ── Delete (tables + uploaded file) ────────────────────────────────────────────
+def delete_rfp_completely(rfp_id: str) -> None:
+    """Remove the RFP's rows from both tables and its folder in the Volume."""
+    rfp_lib.delete_rfp(_execute, FULL_TABLE, FIELDS_TABLE, rfp_id)
+    folder = f"{VOLUME_PATH}/{rfp_id}"
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient(config=_config())
+        for entry in w.files.list_directory_contents(folder):
+            w.files.delete(entry.path)
+        w.files.delete_directory(folder)
+        logger.info("delete %s: volume folder removed", rfp_id)
+    except Exception as exc:
+        # rows are gone; an orphaned file is harmless but worth a log line
+        logger.warning("delete %s: volume cleanup failed (%s)", rfp_id, exc)
 
 
 # ── Delta helpers for the UI ───────────────────────────────────────────────────
@@ -341,6 +373,19 @@ with st.sidebar:
             st.session_state.messages = []
             _load_rfp_row.clear()  # invalidate cache for the old rfp
 
+        with st.popover("🗑️ Delete selected RFP"):
+            st.warning(
+                f"Permanently deletes **{labels.get(selected, selected)}** — extracted "
+                "fields, correction history, and the uploaded file. Cannot be undone."
+            )
+            if st.button("Yes, delete permanently", type="primary", key="confirm_delete"):
+                with st.spinner("Deleting…"):
+                    delete_rfp_completely(selected)
+                st.session_state.rfp_id = None
+                st.session_state.messages = []
+                list_ready_rfps.clear()
+                st.rerun()
+
     else:
         st.info("No RFPs ingested yet. Upload one below.")
 
@@ -411,9 +456,41 @@ CONFIDENCE_BADGE = {
     "Not found": "⚪ Not found",
 }
 MULTILINE_FIELDS = {
-    "summary", "roles_required", "technologies",
+    "summary", "technologies",
     "evaluation_criteria", "compliance_requirements", "response_format",
 }
+ROLE_COLUMNS = ["title", "seniority", "requirements"]
+
+
+def _parse_roles(value: str):
+    """Parse the stored roles JSON. Returns list of dicts, or None if the value
+    is not structured roles (legacy flat string / 'not stated')."""
+    if value == "not stated":
+        return []
+    try:
+        # strict=False tolerates control characters inside strings — rows written
+        # before the backslash-escaping fix in rfp_lib._esc() contain them
+        parsed = json.loads(value, strict=False)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(parsed, list) and all(isinstance(r, dict) for r in parsed):
+        return parsed
+    return None
+
+
+def _roles_canonical(rows) -> str:
+    """Editable columns only, empty titles dropped — comparable & storable form."""
+    clean = []
+    for r in rows:
+        title = str(r.get("title") or "").strip()
+        if not title:
+            continue
+        clean.append({
+            "title": title,
+            "seniority": str(r.get("seniority") or "").strip() or "not stated",
+            "requirements": str(r.get("requirements") or "").strip() or "not stated",
+        })
+    return json.dumps(clean, ensure_ascii=False) if clean else "not stated"
 
 tab_fields, tab_chat = st.tabs(["📋 Extracted fields", "💬 Chat"])
 
@@ -433,22 +510,57 @@ with tab_fields:
         )
         with st.form("fields_form"):
             edited: dict[str, str] = {}
+            baseline: dict[str, str] = {}
             for field, info in current.items():
                 label = field.replace("_", " ").capitalize()
                 badge = CONFIDENCE_BADGE.get(info["confidence"], info["confidence"])
+                score = info.get("confidence_score")
+                score_txt = f" · {score:.2f}" if score is not None else ""
                 suffix = "  ·  ✏️ corrected" if info["source"] == "reviewer_override" else ""
+
+                roles_rows = _parse_roles(info["value"]) if field == "roles_required" else None
+                if roles_rows is not None:
+                    # structured roles: editable table + per-role details underneath
+                    st.markdown(f"**{label}**   ({badge}{score_txt}{suffix})")
+                    table_rows = [{c: r.get(c, "") for c in ROLE_COLUMNS} for r in roles_rows]
+                    edited_rows = st.data_editor(
+                        table_rows,
+                        num_rows="dynamic",
+                        use_container_width=True,
+                        key=f"roles_{current_rfp_id}",
+                    )
+                    edited[field] = _roles_canonical(edited_rows)
+                    baseline[field] = _roles_canonical(table_rows)
+                    detailed = [r for r in roles_rows if r.get("confidence_score") is not None or r.get("citations")]
+                    if detailed:
+                        with st.expander(f"📎 Per-role confidence & citations ({len(detailed)})"):
+                            for r in roles_rows:
+                                r_badge = CONFIDENCE_BADGE.get(r.get("confidence", ""), r.get("confidence", ""))
+                                r_score = r.get("confidence_score")
+                                r_score_txt = f" · {r_score:.2f}" if isinstance(r_score, (int, float)) else ""
+                                st.markdown(f"**{r.get('title', '?')}** — {r_badge}{r_score_txt}")
+                                for snippet in r.get("citations") or []:
+                                    st.markdown(f"> {snippet}")
+                    continue
+
                 widget = st.text_area if field in MULTILINE_FIELDS else st.text_input
                 edited[field] = widget(
-                    f"{label}   ({badge}{suffix})",
+                    f"{label}   ({badge}{score_txt}{suffix})",
                     value=info["value"],
                     key=f"field_{current_rfp_id}_{field}",
                 )
+                baseline[field] = info["value"] or ""
+                citations = info.get("citations") or []
+                if citations:
+                    with st.expander(f"📎 Citations ({len(citations)})"):
+                        for snippet in citations:
+                            st.markdown(f"> {snippet}")
             submitted = st.form_submit_button("💾 Save corrections", type="primary")
 
         if submitted:
             changes = {
                 f: v for f, v in edited.items()
-                if v.strip() != (current[f]["value"] or "").strip()
+                if v.strip() != (baseline.get(f) or "").strip()
             }
             if not changes:
                 st.info("Nothing changed.")

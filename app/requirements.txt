@@ -3,3 +3,4 @@ databricks-sdk>=0.38
 databricks-sql-connector>=4.0
 openai>=1.60
 truststore>=0.10          # OS trust store for TLS; needed behind SSL-inspecting VPNs
+python-dotenv>=1.0
