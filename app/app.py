@@ -459,6 +459,8 @@ MULTILINE_FIELDS = {
     "summary", "technologies",
     "evaluation_criteria", "compliance_requirements", "response_format",
 }
+# Still extracted and stored (chat context, older RFPs), just not shown for review
+HIDDEN_FIELDS = {"roles_required"}
 ROLE_COLUMNS = ["title", "seniority", "requirements"]
 
 
@@ -512,6 +514,8 @@ with tab_fields:
             edited: dict[str, str] = {}
             baseline: dict[str, str] = {}
             for field, info in current.items():
+                if field in HIDDEN_FIELDS:
+                    continue
                 label = field.replace("_", " ").capitalize()
                 badge = CONFIDENCE_BADGE.get(info["confidence"], info["confidence"])
                 score = info.get("confidence_score")
